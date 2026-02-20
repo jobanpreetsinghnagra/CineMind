@@ -2,13 +2,11 @@
 
 A movie recommender system built with **Matrix Factorization** using PyTorch's `nn.Embedding` layers.
 
----
 
 ## Dataset
 
 [Movie Recommendation System — Kaggle](https://www.kaggle.com/datasets/parasharmanas/movie-recommendation-system?select=movies.csv)
 
----
 
 ## Project Structure
 
@@ -35,7 +33,6 @@ CINEMIND/
 └── README.md
 ```
 
----
 
 ## Setup
 
@@ -101,7 +98,7 @@ http://localhost:8080/index.html
 
 ## Model
 
-The recommender uses **Matrix Factorization** — users and movies are each represented as learned embedding vectors, and the model predicts ratings from their dot product interaction.
+The recommender uses **Matrix Factorization** users and movies are each represented as learned embedding vectors, and the model predicts ratings from their dot product interaction.
 
 ### Training Hardware
 
