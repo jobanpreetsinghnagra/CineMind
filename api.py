@@ -30,9 +30,9 @@ log = logging.getLogger("cinemind")
 
 # Config
 MODEL_PATH    = "models/model_weights.pth"          # root of moviesys/
-RATINGS_PATH  = "data/raw/ratings.csv"        # moviesys/dataset/ratings.csv  — VERIFY this file exists here
+RATINGS_PATH  = "data/raw/ratings.csv"        # Optional: only needed for /api/movies/popular endpoint
 MOVIES_PATH   = "data/raw/movies.csv"         # moviesys/dataset/movies.csv
-EMBEDDING_DIM = 64                           # must match training
+EMBEDDING_DIM = 64                           # must match training (fallback if not in checkpoint)
 TOP_K_DEFAULT = 10                           # recommendations returned by default
 
 
@@ -65,33 +65,52 @@ class MovieRecommender:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         log.info("Device: %s", self.device)
 
-        #  data
-        log.info("Loading ratings from %s …", RATINGS_PATH)
-        self.ratings_df = pd.read_csv(RATINGS_PATH)
-
+        # Load movies for titles
         log.info("Loading movies from %s …", MOVIES_PATH)
         self.movies_df = pd.read_csv(MOVIES_PATH)
 
-        # ID mappings
-        unique_users = sorted(self.ratings_df["userId"].unique())
-        unique_items = sorted(self.ratings_df["movieId"].unique())
-
-        self.user_to_idx = {u: i for i, u in enumerate(unique_users)}
-        self.item_to_idx = {m: i for i, m in enumerate(unique_items)}
-        self.idx_to_item = {i: m for m, i in self.item_to_idx.items()}
-
-        self.num_users = len(unique_users)
-        self.num_items = len(unique_items)
-        log.info("Users: %d  |  Items: %d", self.num_users, self.num_items)
-
-        # model
-        log.info("Loading model weights from %s …", MODEL_PATH)
-        self.model = MatrixFactorizationWithBias(
-            self.num_users, self.num_items, EMBEDDING_DIM
-        ).to(self.device)
-
+        # Load model checkpoint
+        log.info("Loading model checkpoint from %s …", MODEL_PATH)
         checkpoint = torch.load(MODEL_PATH, map_location=self.device)
-        self.model.load_state_dict(checkpoint)
+        
+        # Check if checkpoint contains metadata (full checkpoint) or just state_dict
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            # Full checkpoint with metadata
+            log.info("Loading mappings from checkpoint metadata…")
+            self.item_to_idx = checkpoint['item_to_idx']
+            self.user_to_idx = checkpoint.get('user_to_idx', {})
+            self.num_users = checkpoint['num_users']
+            self.num_items = checkpoint['num_items']
+            embedding_dim = checkpoint.get('embedding_dim', EMBEDDING_DIM)
+            state_dict = checkpoint['model_state_dict']
+            self.ratings_df = None  # Not needed when using full checkpoint
+        else:
+            # Legacy format: just state_dict, need to reconstruct from ratings.csv
+            log.warning("Checkpoint appears to be state_dict only. Loading ratings.csv to reconstruct mappings…")
+            if not os.path.exists(RATINGS_PATH):
+                raise RuntimeError(
+                    f"Model checkpoint doesn't contain metadata and {RATINGS_PATH} is missing. "
+                    "Please retrain the model using the save_model() method that includes metadata."
+                )
+            self.ratings_df = pd.read_csv(RATINGS_PATH)
+            unique_users = sorted(self.ratings_df["userId"].unique())
+            unique_items = sorted(self.ratings_df["movieId"].unique())
+            self.user_to_idx = {u: i for i, u in enumerate(unique_users)}
+            self.item_to_idx = {m: i for i, m in enumerate(unique_items)}
+            self.num_users = len(unique_users)
+            self.num_items = len(unique_items)
+            embedding_dim = EMBEDDING_DIM
+            state_dict = checkpoint
+
+        # Build reverse mapping
+        self.idx_to_item = {i: m for m, i in self.item_to_idx.items()}
+        log.info("Users: %d  |  Items: %d  |  Embedding dim: %d", self.num_users, self.num_items, embedding_dim)
+
+        # Initialize and load model
+        self.model = MatrixFactorizationWithBias(
+            self.num_users, self.num_items, embedding_dim
+        ).to(self.device)
+        self.model.load_state_dict(state_dict)
         self.model.eval()
         log.info("Model loaded successfully ✓")
 
@@ -212,11 +231,16 @@ async def lifespan(app: FastAPI):
     global recommender
     log.info("=== CineMind API starting up ===")
 
-    missing = [p for p in [MODEL_PATH, RATINGS_PATH, MOVIES_PATH] if not os.path.exists(p)]
+    # Only MODEL_PATH and MOVIES_PATH are required
+    missing = [p for p in [MODEL_PATH, MOVIES_PATH] if not os.path.exists(p)]
     if missing:
         log.error("Missing required files: %s", missing)
-        log.error("Make sure model_weights.pth and dataset/ folder are present.")
-        raise RuntimeError(f"Missing files: {missing}")
+        log.error("Make sure model_weights.pth and movies.csv are present.")
+        raise RuntimeError(f"Missing required files: {missing}")
+    
+    # RATINGS_PATH is optional (only needed for legacy models or /api/movies/popular endpoint)
+    if not os.path.exists(RATINGS_PATH):
+        log.warning("ratings.csv not found. /api/movies/popular endpoint will be unavailable.")
 
     recommender = MovieRecommender()
     log.info("=== API ready ===")
@@ -312,6 +336,14 @@ def popular_movies(n: int = 20):
     """Return the n most-rated movies (useful for debugging / seeding the UI)."""
     if recommender is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet.")
+
+    # Check if ratings_df is available (only if checkpoint was state_dict only)
+    if not hasattr(recommender, 'ratings_df') or recommender.ratings_df is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Popular movies endpoint requires ratings.csv. "
+            "This endpoint is only available when using legacy model format."
+        )
 
     counts = (
         recommender.ratings_df.groupby("movieId")
